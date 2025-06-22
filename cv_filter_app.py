@@ -1,200 +1,191 @@
-import streamlit as st
 import os
 import re
+import json
+import time
+import zipfile
 import shutil
-import tempfile
-from docx import Document
-import pandas as pd
-import PyPDF2
-import spacy
-from pdf2image import convert_from_path
-from PIL import Image
+import ollama
 import pytesseract
+import pandas as pd
+from io import BytesIO
+from PyPDF2 import PdfReader
+from pdf2image import convert_from_path
+from docx import Document
+import streamlit as st
 
-# Load spaCy model
-nlp = spacy.load("en_core_web_sm")
+# === UI Config ===
+st.set_page_config(page_title="CV Filter App", layout="wide")
 
-# Poppler path (update this to your system path)
-POPPLER_PATH = r"C:\Users\DELL\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin"  # <-- Change this to your poppler path
+# === Streamlit Sidebar Option ===
+st.sidebar.title("CV Filter Settings")
+folder_path = st.sidebar.text_input("📁 Folder path containing CVs:", value="C:/Users/DELL/Downloads/OneDrive_2_6-3-2025/")
+keywords_input = st.sidebar.text_input("🔑 Keywords to filter on (comma-separated):", value="Python, SQL, T24, Agile")
+extract_details = st.sidebar.checkbox("🤖 Extract detailed experience (via LLM)", value=False)
 
-# --- Extract Text Functions ---
-def extract_text_from_pdf(file_path):
-    text = ""
-    is_image_based = False
+# Process Button
+process_triggered = st.button("🚀 Process CVs")
+
+# Constants
+POPPLER_PATH = 'C:/Users/DELL/Downloads/Release-24.08.0-0/poppler-24.08.0/Library/bin'
+TESSERACT_PATH = "C:/Program Files/Tesseract-OCR/tesseract.exe"
+MODEL_NAME = "mistral"
+
+# Set Tesseract path
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# Convert keyword string to list
+KEYWORDS = [k.strip() for k in keywords_input.split(',') if k.strip()]
+
+def extract_text_from_docx(docx_path):
     try:
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                content = page.extract_text()
-                if content:
-                    text += content
-                else:
-                    is_image_based = True
-    except:
-        is_image_based = True
-
-    if is_image_based or not text.strip():
-        try:
-            images = convert_from_path(file_path, poppler_path=POPPLER_PATH)
-            text = ""
-            for img in images:
-                text += pytesseract.image_to_string(img)
-        except Exception as e:
-            print(f"OCR failed: {e}")
-
-    return text, is_image_based
-
-def extract_text_from_docx(file_path):
-    try:
-        doc = Document(file_path)
+        doc = Document(docx_path)
         return "\n".join([para.text for para in doc.paragraphs])
-    except:
+    except Exception:
         return ""
 
-# --- Name Extraction ---
-def extract_name_with_spacy(text):
-    doc = nlp(text)
-    for ent in doc.ents:
-        if ent.label_ == "PERSON" and 2 <= len(ent.text.split()) <= 4:
-            return ent.text
-    return "N/A"
+if process_triggered:
+    if not os.path.exists(folder_path):
+        st.error("❌ The provided folder path does not exist.")
+        st.stop()
 
-# --- Info Extraction ---
-def extract_candidate_info(text):
-    email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", text)
-    email = email_match.group().strip() if email_match else "N/A"
+    cv_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.pdf', '.docx', '.doc'))]
 
-    phone_match = re.search(r"(03\d{2}[-\s]?\d{7})", text)
-    phone = phone_match.group().strip() if phone_match else "N/A"
+    if not cv_files:
+        st.warning("⚠️ No valid CV files found in the folder.")
+        st.stop()
 
-    linkedin_match = re.search(r"(https?://)?(www\\.)?linkedin\\.com/in/[A-Za-z0-9\-_/]{5,}", text)
-    linkedin = linkedin_match.group().strip() if linkedin_match else "N/A"
-    if linkedin != "N/A" and not linkedin.startswith("http"):
-        linkedin = "https://" + linkedin
+    results = []
+    matched_cvs = []
+    total_files = len(cv_files)
+    start_time = time.time()
+    progress = st.progress(0)
+    status_text = st.empty()
 
-    name = extract_name_with_spacy(text)
+    for idx, filename in enumerate(cv_files):
+        file_path = os.path.join(folder_path, filename)
+        extracted_text = ""
+        file_ext = filename.lower().split(".")[-1]
 
-    return {
-        "Name": name,
-        "Email": email,
-        "Phone": phone,
-        "LinkedIn": linkedin,
-    }
+        try:
+            if file_ext == 'pdf':
+                reader = PdfReader(file_path)
+                if reader.pages:
+                    extracted_text = "\n".join([page.extract_text() or "" for page in reader.pages])
+                if not extracted_text.strip():
+                    pages = convert_from_path(file_path, 300, poppler_path=POPPLER_PATH)
+                    extracted_text = "\n".join([pytesseract.image_to_string(page) for page in pages])
+            elif file_ext in ['doc', 'docx']:
+                extracted_text = extract_text_from_docx(file_path)
+            else:
+                continue
+        except Exception:
+            continue  # skip broken files
 
-def match_keywords(text, keywords):
-    text_lower = text.lower()
-    found = [kw for kw in keywords if kw.lower() in text_lower]
-    score = int(len(found) / len(keywords) * 100) if keywords else 0
-    return found, score
+        def match_keywords(text, keywords):
+            text_lower = text.lower()
+            found = [kw for kw in keywords if kw.lower() in text_lower]
+            score = int(len(found) / len(keywords) * 100) if keywords else 0
+            return found, score
 
+        matched_keywords, match_score = match_keywords(extracted_text, KEYWORDS)
 
-# --- Process Files ---
-def process_files(source_folder, keywords):
-    matched_files = []
-    manual_review_files = []
-    data = []
-
-    dest_dir = os.path.join(source_folder, "matched")
-    manual_dir = os.path.join(dest_dir, "manual_review")
-    os.makedirs(dest_dir, exist_ok=True)
-    os.makedirs(manual_dir, exist_ok=True)
-
-    for file in os.listdir(source_folder):
-        path = os.path.join(source_folder, file)
-        ext = file.lower()
-
-        if not os.path.isfile(path) or not ext.endswith(('.pdf', '.docx')):
-            continue
-
-        if ext.endswith('.pdf'):
-            text, is_image = extract_text_from_pdf(path)
-        else:
-            text = extract_text_from_docx(path)
-            is_image = False
-
-        candidate_info = extract_candidate_info(text)
-        matched_keywords, score = match_keywords(text, keywords)
-
-        record = {
-            "Filename": file,
-            "Name": candidate_info.get("Name", "N/A"),
-            "Email": candidate_info.get("Email", "N/A"),
-            "Phone": candidate_info.get("Phone", "N/A"),
-            "LinkedIn": candidate_info.get("LinkedIn", "N/A"),
-            "Match Score": score,
-            "Matched Keywords": ", ".join(matched_keywords) if matched_keywords else "N/A",
-            "Manual Review": "Yes" if is_image else "No",
-            "Match": "Yes" if matched_keywords else "No"
+        result_entry = {
+            "Filename": filename,
+            "Match Score": match_score,
+            "Matched Keywords": ", ".join(matched_keywords)
         }
 
-        data.append(record)
-
         if matched_keywords:
-            shutil.copy(path, os.path.join(dest_dir, file))
-        if is_image:
-            shutil.copy(path, os.path.join(manual_dir, file))
+            matched_cvs.append(file_path)
 
-    return data, dest_dir
+        if extract_details:
+            prompt = f"""
+            From the following CV text, extract the candidate’s work experience:
 
-# --- Streamlit UI ---
-st.set_page_config("CV Filter App", layout="wide")
-col1, col2 = st.columns([4, 6])
+            - Total years of experience
+            - Experience by domain (e.g., IT, Finance)
+            - List of roles with title, company, duration, and inferred domain
 
-with col1:
-    st.markdown("# CVify")
-    st.markdown("###### Fast. Focused. Filtered.")
+            Return the result in this JSON format:
 
-with col2:
-    st.markdown("#### ")
+            {{
+              "total_experience_years": 6.5,
+              "experience_by_domain": {{
+                "IT": 3,
+                "Finance": 2.5
+              }},
+              "roles": [
+                {{
+                  "title": "Software Engineer",
+                  "company": "XYZ Corp",
+                  "start": "Jan 2020",
+                  "end": "June 2023",
+                  "domain": "IT"
+                }}
+              ]
+            }}
 
-uploaded_zip = st.file_uploader("Upload Zipped CVs (PDF/DOCX)", type=["zip"])
-keyword_input = st.text_input("Keywords (comma-separated)", "Python, SQL, T24, Agile")
+            CV Text:
+            {extracted_text}
+            """
 
-if st.button("Process"):
-    if not uploaded_zip:
-        st.error("Please upload a zip file.")
+            try:
+                response = ollama.chat(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
+                llm_output = response["message"]["content"]
+                try:
+                    data = json.loads(llm_output)
+                except json.JSONDecodeError:
+                    json_like_match = re.search(r'\{.*\}', llm_output, re.DOTALL)
+                    if json_like_match:
+                        data = json.loads(json_like_match.group())
+                    else:
+                        continue
+            except Exception:
+                continue
+
+            data['matched_keywords'] = matched_keywords
+            data['match_score'] = match_score
+            result_entry.update(data)
+
+            json_path = os.path.join(folder_path, f"{os.path.splitext(filename)[0]}_experience.json")
+            excel_path = os.path.join(folder_path, f"{os.path.splitext(filename)[0]}_experience.xlsx")
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+            df = pd.DataFrame(data.get("roles", []))
+            if not df.empty:
+                df["Matched Keywords"] = ", ".join(matched_keywords)
+                df["Match Score"] = match_score
+                df.to_excel(excel_path, index=False)
+
+        results.append(result_entry)
+
+        percent_complete = int(((idx + 1) / total_files) * 100)
+        elapsed = time.time() - start_time
+        eta = (elapsed / (idx + 1)) * (total_files - idx - 1)
+        status_text.text(f"⏳ Processed {idx + 1} of {total_files} CVs | ETA: {int(eta)}s")
+        progress.progress(percent_complete)
+
+    df_summary = pd.DataFrame(results)
+    if not df_summary.empty:
+        st.subheader("📊 Summary Table")
+        st.dataframe(df_summary, use_container_width=True)
     else:
-        temp_dir = tempfile.mkdtemp()
-        zip_path = os.path.join(temp_dir, "cvs.zip")
-        with open(zip_path, "wb") as f:
-            f.write(uploaded_zip.read())
+        st.warning("No results to show.")
 
-        shutil.unpack_archive(zip_path, temp_dir)
+    if matched_cvs:
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zipf:
+            for file_path in matched_cvs:
+                zipf.write(file_path, os.path.basename(file_path))
+        zip_buffer.seek(0)
+        st.session_state['download_data'] = zip_buffer.read()
 
-        keywords = [k.strip() for k in keyword_input.split(",") if k.strip()]
-        st.success("Processing CVs...")
-        result_data, matched_folder = process_files(temp_dir, keywords)
-
-        if result_data:
-            df = pd.DataFrame(result_data)
-            st.subheader("📊 Match Results")
-
-            filtered_df = df[(df["Match"] == "Yes") | (df["Manual Review"] == "Yes")]
-
-            def highlight_manual_review(row):
-                color = "#9e8942" if row["Manual Review"] == "Yes" else ""
-                return ['background-color: {}'.format(color)] * len(row)
-
-            st.dataframe(
-                filtered_df.style.apply(highlight_manual_review, axis=1),
-                use_container_width=True
-            )
-
-            excel_path = os.path.join(temp_dir, "CV_Report.xlsx")
-            df.to_excel(excel_path, index=False)
-            with open(excel_path, "rb") as f:
-                st.download_button("📥 Download Excel Report", f, file_name="CV_Report.xlsx")
-
-            matched_zip = shutil.make_archive(os.path.join(temp_dir, "matched_cv_output"), 'zip', matched_folder)
-            with open(matched_zip, "rb") as f:
-                st.download_button("📥 Download Matched CVs", f, file_name="Matched_CVs.zip")
-
-            total = len(df)
-            matched = df["Match"].value_counts().get("Yes", 0)
-            manual_review = df["Manual Review"].value_counts().get("Yes", 0)
-
-            st.info(f"✅ {matched}/{total} CVs matched keywords.")
-            if manual_review:
-                st.warning(f"⚠️ {manual_review} CVs may be image-based and need manual review.")
-        else:
-            st.warning("No valid CVs found or none matched.")
+        st.success("🎉 CV processing complete!")
+        st.download_button(
+            label="📥 Download Matched CVs",
+            data=st.session_state.get('download_data', b""),
+            file_name="matched_cvs.zip",
+            mime="application/zip"
+        )
